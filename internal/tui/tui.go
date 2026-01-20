@@ -3,7 +3,9 @@ package tui
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,6 +56,7 @@ type Model struct {
 
 	intercept bool
 	flows     map[int64]*proxy.Flow
+	hostOpen  map[string]bool
 	list      list.Model
 	detail    viewport.Model
 
@@ -73,6 +76,7 @@ type Model struct {
 
 type flowItem struct {
 	id    int64
+	host  string
 	title string
 	desc  string
 }
@@ -80,6 +84,24 @@ type flowItem struct {
 func (i flowItem) Title() string       { return i.title }
 func (i flowItem) Description() string { return i.desc }
 func (i flowItem) FilterValue() string { return i.title }
+
+type groupItem struct {
+	host     string
+	count    int
+	lastID   int64
+	expanded bool
+}
+
+func (i groupItem) Title() string {
+	icon := "▸"
+	if i.expanded {
+		icon = "▾"
+	}
+	return fmt.Sprintf("%s %s (%d)", icon, i.host, i.count)
+}
+
+func (i groupItem) Description() string { return "" }
+func (i groupItem) FilterValue() string { return i.host }
 
 type flowMsg struct{ snap *proxy.FlowSnapshot }
 type toastMsg struct{ text string }
@@ -135,6 +157,7 @@ func New(cfg Config) Model {
 		help:      help.New(),
 		intercept: false,
 		flows:     map[int64]*proxy.Flow{},
+		hostOpen:  map[string]bool{},
 		list:      l,
 		detail:    d,
 		scr:       screenMain,
@@ -209,6 +232,15 @@ func (m Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, m.keys.Toggle):
+		it := m.list.SelectedItem()
+		if gi, ok := it.(groupItem); ok {
+			m.hostOpen[gi.host] = !m.hostOpen[gi.host]
+			m.rebuildList()
+			m.updateDetail()
+			return m, nil
+		}
+		return m, nil
 	case key.Matches(msg, m.keys.ToggleIntercept):
 		m.intercept = !m.intercept
 		if m.cfg.SetIntercept != nil {
@@ -532,30 +564,90 @@ func (m *Model) layout() {
 }
 
 func (m *Model) rebuildList() {
-	items := make([]list.Item, 0, len(m.flows))
-	for _, f := range m.flows {
-		title := fmt.Sprintf("%d  %s %s", f.ID, padRight(f.Method, 6), shortURL(f.URL))
-		desc := fmt.Sprintf("%s | %s | %s", statusLabel(f), durationLabel(f), hostLabel(f))
-		items = append(items, flowItem{id: f.ID, title: title, desc: desc})
+	type group struct {
+		host   string
+		count  int
+		lastID int64
+		flows  []*proxy.Flow
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].(flowItem).id > items[j].(flowItem).id
-	})
-	sel := m.selectedFlowID()
+
+	selectedKind, selectedHost, selectedID := m.selectedKey()
+
+	byHost := map[string]*group{}
+	for _, f := range m.flows {
+		h := normalizeHost(f)
+		g := byHost[h]
+		if g == nil {
+			g = &group{host: h}
+			byHost[h] = g
+		}
+		g.count++
+		if f.ID > g.lastID {
+			g.lastID = f.ID
+		}
+		g.flows = append(g.flows, f)
+	}
+
+	groups := make([]*group, 0, len(byHost))
+	for _, g := range byHost {
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].lastID > groups[j].lastID })
+
+	items := make([]list.Item, 0, len(m.flows)+len(groups))
+	for _, g := range groups {
+		open := m.hostOpen[g.host]
+		items = append(items, groupItem{host: g.host, count: g.count, lastID: g.lastID, expanded: open})
+		if !open {
+			continue
+		}
+		sort.Slice(g.flows, func(i, j int) bool { return g.flows[i].ID > g.flows[j].ID })
+		for _, f := range g.flows {
+			title := fmt.Sprintf("  %d  %s %s", f.ID, padRight(f.Method, 6), shortURL(pathFromURL(f.URL)))
+			desc := fmt.Sprintf("%s | %s", statusLabel(f), durationLabel(f))
+			items = append(items, flowItem{id: f.ID, host: g.host, title: title, desc: desc})
+		}
+	}
+
 	m.list.SetItems(items)
-	if sel != 0 {
-		for i, it := range items {
-			if it.(flowItem).id == sel {
+	for i, it := range items {
+		switch v := it.(type) {
+		case flowItem:
+			if selectedKind == "flow" && v.id == selectedID {
 				m.list.Select(i)
-				break
+				return
+			}
+		case groupItem:
+			if selectedKind == "group" && v.host == selectedHost {
+				m.list.Select(i)
+				return
 			}
 		}
+	}
+}
+
+func (m *Model) selectedKey() (kind string, host string, id int64) {
+	it := m.list.SelectedItem()
+	if it == nil {
+		return "", "", 0
+	}
+	switch v := it.(type) {
+	case flowItem:
+		return "flow", v.host, v.id
+	case groupItem:
+		return "group", v.host, 0
+	default:
+		return "", "", 0
 	}
 }
 
 func (m *Model) updateDetail() {
 	f := m.selectedFlow()
 	if f == nil {
+		if gi, ok := m.list.SelectedItem().(groupItem); ok {
+			m.detail.SetContent(m.styles.dim.Render(fmt.Sprintf("%s (%d)", gi.host, gi.count)))
+			return
+		}
 		m.detail.SetContent(m.styles.dim.Render("Selecione uma requisição"))
 		return
 	}
@@ -667,22 +759,64 @@ func (m Model) viewFooter() string {
 	now := time.Now()
 	toast := ""
 	if m.toast != "" && now.Before(m.toastUntil) {
-		toast = m.styles.status.Render(m.toast)
+		toast = m.renderBar(m.styles.status, m.toast)
 	} else {
 		switch m.scr {
 		case screenMain:
-			toast = m.styles.statusDim.Render("i intercept | e edit | f forward | d drop | r repeater | c compose | b breakpoints | x export | q sair")
+			toast = m.renderBar(m.styles.statusDim, "i intercept | enter expande | e edit | f forward | d drop | r repeater | c compose | b breakpoints | x export | q sair")
 		case screenRepeater, screenCompose:
-			toast = m.styles.statusDim.Render("Ctrl+S envia | Esc volta")
+			toast = m.renderBar(m.styles.statusDim, "Ctrl+S envia | Esc volta")
 		case screenEdit:
-			toast = m.styles.statusDim.Render("Ctrl+S aplica/forward | Esc volta")
+			toast = m.renderBar(m.styles.statusDim, "Ctrl+S aplica/forward | Esc volta")
 		case screenBreakpoints:
-			toast = m.styles.statusDim.Render("a add | enter toggle | del remove | esc volta")
+			toast = m.renderBar(m.styles.statusDim, "a add | enter toggle | del remove | esc volta")
 		default:
-			toast = m.styles.statusDim.Render("q sair")
+			toast = m.renderBar(m.styles.statusDim, "q sair")
 		}
 	}
 	return toast
+}
+
+func (m Model) renderBar(s lipgloss.Style, text string) string {
+	w := m.width - m.styles.app.GetHorizontalPadding()
+	if w < 0 {
+		w = 0
+	}
+	return s.Width(w).Render(text)
+}
+
+func normalizeHost(f *proxy.Flow) string {
+	h := strings.TrimSpace(f.Host)
+	if h != "" {
+		if strings.Contains(h, ":") {
+			if host, _, err := net.SplitHostPort(h); err == nil {
+				h = host
+			}
+		}
+		return h
+	}
+	u, err := url.Parse(f.URL)
+	if err == nil {
+		h = u.Hostname()
+		if h != "" {
+			return h
+		}
+	}
+	return "(sem host)"
+}
+
+func pathFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.Path == "" {
+		return "/"
+	}
+	if u.RawQuery != "" {
+		return u.Path + "?" + u.RawQuery
+	}
+	return u.Path
 }
 
 func (m *Model) selectedFlowID() int64 {

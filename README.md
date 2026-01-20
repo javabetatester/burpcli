@@ -15,6 +15,7 @@ Atalhos:
 - `e` edit (quando pendente, Ctrl+S aplica/forward)
 - `r` repeater (Ctrl+S envia, Esc volta)
 - `c` compose (nova requisição, Ctrl+S envia, Esc volta)
+- `enter` expande/colapsa grupo do domínio no histórico
 - `x` exporta request/response para `./exports`
 - `q` sai
 
