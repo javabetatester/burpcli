@@ -26,6 +26,11 @@ type Config struct {
 	ListenAddr   string
 	FlowCh       <-chan *proxy.FlowSnapshot
 	SetIntercept func(bool)
+
+	ListBreakpoints  func() []proxy.BreakpointRule
+	AddBreakpoint    func(string)
+	ToggleBreakpoint func(int64)
+	RemoveBreakpoint func(int64)
 }
 
 type screen int
@@ -33,6 +38,9 @@ type screen int
 const (
 	screenMain screen = iota
 	screenRepeater
+	screenCompose
+	screenEdit
+	screenBreakpoints
 )
 
 type Model struct {
@@ -49,10 +57,15 @@ type Model struct {
 	list      list.Model
 	detail    viewport.Model
 
-	scr      screen
-	rpEditor textarea.Model
-	rpResp   viewport.Model
-	rpStatus string
+	scr         screen
+	editorTitle string
+	editor      textarea.Model
+	resp        viewport.Model
+	status      string
+
+	bpList   list.Model
+	bpInput  textarea.Model
+	bpAdding bool
 
 	toast      string
 	toastUntil time.Time
@@ -91,14 +104,29 @@ func New(cfg Config) Model {
 	d := viewport.New(0, 0)
 	d.Style = lipgloss.NewStyle().Padding(0, 1)
 
-	rp := textarea.New()
-	rp.Placeholder = "Cole uma requisição HTTP aqui"
-	rp.Prompt = ""
-	rp.ShowLineNumbers = true
-	rp.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	ed := textarea.New()
+	ed.Placeholder = "Cole uma requisição HTTP aqui"
+	ed.Prompt = ""
+	ed.ShowLineNumbers = true
+	ed.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(lipgloss.Color("236"))
 
-	rpResp := viewport.New(0, 0)
-	rpResp.Style = lipgloss.NewStyle().Padding(0, 1)
+	resp := viewport.New(0, 0)
+	resp.Style = lipgloss.NewStyle().Padding(0, 1)
+
+	bpl := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	bpl.Title = "Breakpoints"
+	bpl.SetShowHelp(false)
+	bpl.DisableQuitKeybindings()
+	bpl.Styles.Title = bpl.Styles.Title.Foreground(lipgloss.Color("81")).Bold(true)
+	bpl.Styles.PaginationStyle = bpl.Styles.PaginationStyle.Foreground(lipgloss.Color("244"))
+	bpl.Styles.HelpStyle = bpl.Styles.HelpStyle.Foreground(lipgloss.Color("244"))
+
+	bpi := textarea.New()
+	bpi.Placeholder = "match (substring)"
+	bpi.Prompt = ""
+	bpi.ShowLineNumbers = false
+	bpi.SetHeight(1)
+	bpi.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(lipgloss.Color("236"))
 
 	return Model{
 		cfg:       cfg,
@@ -110,8 +138,10 @@ func New(cfg Config) Model {
 		list:      l,
 		detail:    d,
 		scr:       screenMain,
-		rpEditor:  rp,
-		rpResp:    rpResp,
+		editor:    ed,
+		resp:      resp,
+		bpList:    bpl,
+		bpInput:   bpi,
 	}
 }
 
@@ -150,15 +180,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenForFlows(m.cfg.FlowCh)
 	case rpRespMsg:
 		if msg.err != nil {
-			m.rpStatus = "erro: " + msg.err.Error()
+			m.status = "erro: " + msg.err.Error()
 		} else {
-			m.rpStatus = msg.status
-			m.rpResp.SetContent(msg.body)
+			m.status = msg.status
+			m.resp.SetContent(msg.body)
 		}
 		return m, nil
 	case tea.KeyMsg:
-		if m.scr == screenRepeater {
+		if m.scr == screenRepeater || m.scr == screenCompose {
 			return m.updateRepeater(msg)
+		}
+		if m.scr == screenEdit {
+			return m.updateEdit(msg)
+		}
+		if m.scr == screenBreakpoints {
+			return m.updateBreakpoints(msg)
 		}
 		return m.updateMain(msg)
 	}
@@ -182,16 +218,32 @@ func (m Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Forward):
 		f := m.selectedFlow()
 		if f != nil && f.Intercepted && f.Pending {
-			f.Decide(proxy.DecisionForward)
+			f.Forward()
 			return m, toastCmd("Forward")
 		}
 		return m, nil
 	case key.Matches(msg, m.keys.Drop):
 		f := m.selectedFlow()
 		if f != nil && f.Intercepted && f.Pending {
-			f.Decide(proxy.DecisionDrop)
+			f.Drop()
 			return m, toastCmd("Drop")
 		}
+		return m, nil
+	case key.Matches(msg, m.keys.Edit):
+		f := m.selectedFlow()
+		if f == nil || !f.Intercepted || !f.Pending {
+			return m, nil
+		}
+		if strings.TrimSpace(f.RawRequest) == "" {
+			return m, toastCmd("edição indisponível")
+		}
+		m.scr = screenEdit
+		m.editorTitle = fmt.Sprintf("Edit #%d", f.ID)
+		m.status = "Ctrl+S aplica/forward | Esc volta"
+		m.resp.SetContent("")
+		m.editor.SetValue(f.RawRequest)
+		m.editor.Focus()
+		m.layout()
 		return m, nil
 	case key.Matches(msg, m.keys.Export):
 		f := m.selectedFlow()
@@ -206,13 +258,31 @@ func (m Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Repeater):
 		f := m.selectedFlow()
 		m.scr = screenRepeater
-		m.rpStatus = "Ctrl+S envia | Esc volta"
-		m.rpResp.SetContent("")
-		m.rpEditor.SetValue("")
+		m.editorTitle = "Repeater"
+		m.status = "Ctrl+S envia | Esc volta"
+		m.resp.SetContent("")
+		m.editor.SetValue("")
 		if f != nil {
-			m.rpEditor.SetValue(renderRawRequest(f))
+			m.editor.SetValue(renderRawRequest(f))
 		}
-		m.rpEditor.Focus()
+		m.editor.Focus()
+		m.layout()
+		return m, nil
+	case key.Matches(msg, m.keys.Compose):
+		m.scr = screenCompose
+		m.editorTitle = "Compose"
+		m.status = "Ctrl+S envia | Esc volta"
+		m.resp.SetContent("")
+		m.editor.SetValue("")
+		m.editor.Focus()
+		m.layout()
+		return m, nil
+	case key.Matches(msg, m.keys.Breakpoints):
+		m.scr = screenBreakpoints
+		m.bpAdding = false
+		m.bpInput.SetValue("")
+		m.bpInput.Blur()
+		m.refreshBreakpoints()
 		m.layout()
 		return m, nil
 	}
@@ -227,17 +297,135 @@ func (m Model) updateRepeater(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Back):
 		m.scr = screenMain
-		m.rpEditor.Blur()
+		m.editor.Blur()
 		m.layout()
 		return m, nil
 	case key.Matches(msg, m.keys.Send):
-		raw := m.rpEditor.Value()
-		m.rpStatus = "enviando..."
+		raw := m.editor.Value()
+		m.status = "enviando..."
 		return m, sendRepeaterCmd(raw)
 	}
 
 	var cmd tea.Cmd
-	m.rpEditor, cmd = m.rpEditor.Update(msg)
+	m.editor, cmd = m.editor.Update(msg)
+	return m, cmd
+}
+
+func (m Model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keys.Back):
+		m.scr = screenMain
+		m.editor.Blur()
+		m.layout()
+		return m, nil
+	case key.Matches(msg, m.keys.Send):
+		f := m.selectedFlow()
+		if f != nil && f.Intercepted && f.Pending {
+			raw := m.editor.Value()
+			f.ForwardRaw(raw)
+			m.scr = screenMain
+			m.editor.Blur()
+			m.layout()
+			return m, toastCmd("aplicado")
+		}
+		m.scr = screenMain
+		m.editor.Blur()
+		m.layout()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.editor, cmd = m.editor.Update(msg)
+	return m, cmd
+}
+
+type bpItem struct {
+	id    int64
+	title string
+	desc  string
+}
+
+func (i bpItem) Title() string       { return i.title }
+func (i bpItem) Description() string { return i.desc }
+func (i bpItem) FilterValue() string { return i.title }
+
+func (m *Model) refreshBreakpoints() {
+	if m.cfg.ListBreakpoints == nil {
+		m.bpList.SetItems(nil)
+		return
+	}
+	rules := m.cfg.ListBreakpoints()
+	sort.Slice(rules, func(i, j int) bool { return rules[i].ID > rules[j].ID })
+	items := make([]list.Item, 0, len(rules))
+	for _, r := range rules {
+		state := "OFF"
+		if r.Enabled {
+			state = "ON"
+		}
+		items = append(items, bpItem{id: r.ID, title: fmt.Sprintf("[%s] %s", state, r.Match), desc: fmt.Sprintf("id=%d", r.ID)})
+	}
+	m.bpList.SetItems(items)
+}
+
+func (m Model) updateBreakpoints(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.bpAdding {
+		switch {
+		case key.Matches(msg, m.keys.Back):
+			m.bpAdding = false
+			m.bpInput.SetValue("")
+			m.bpInput.Blur()
+			return m, nil
+		case key.Matches(msg, m.keys.Toggle):
+			match := strings.TrimSpace(m.bpInput.Value())
+			if match != "" && m.cfg.AddBreakpoint != nil {
+				m.cfg.AddBreakpoint(match)
+			}
+			m.bpAdding = false
+			m.bpInput.SetValue("")
+			m.bpInput.Blur()
+			m.refreshBreakpoints()
+			return m, nil
+		}
+
+		var cmd tea.Cmd
+		m.bpInput, cmd = m.bpInput.Update(msg)
+		return m, cmd
+	}
+
+	switch {
+	case key.Matches(msg, m.keys.Back):
+		m.scr = screenMain
+		m.layout()
+		return m, nil
+	case key.Matches(msg, m.keys.Add):
+		m.bpAdding = true
+		m.bpInput.SetValue("")
+		m.bpInput.Focus()
+		return m, nil
+	case key.Matches(msg, m.keys.Toggle):
+		it := m.bpList.SelectedItem()
+		if it != nil {
+			id := it.(bpItem).id
+			if m.cfg.ToggleBreakpoint != nil {
+				m.cfg.ToggleBreakpoint(id)
+			}
+			m.refreshBreakpoints()
+		}
+		return m, nil
+	case key.Matches(msg, m.keys.Remove):
+		it := m.bpList.SelectedItem()
+		if it != nil {
+			id := it.(bpItem).id
+			if m.cfg.RemoveBreakpoint != nil {
+				m.cfg.RemoveBreakpoint(id)
+			}
+			m.refreshBreakpoints()
+		}
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.bpList, cmd = m.bpList.Update(msg)
 	return m, cmd
 }
 
@@ -253,10 +441,16 @@ func toastCmd(text string) tea.Cmd {
 }
 
 func (m Model) View() string {
-	if m.scr == screenRepeater {
+	switch m.scr {
+	case screenRepeater, screenCompose:
 		return m.viewRepeater()
+	case screenEdit:
+		return m.viewEdit()
+	case screenBreakpoints:
+		return m.viewBreakpoints()
+	default:
+		return m.viewMain()
 	}
-	return m.viewMain()
 }
 
 func (m *Model) layout() {
@@ -283,10 +477,46 @@ func (m *Model) layout() {
 		if respH < 4 {
 			respH = 4
 		}
-		m.rpEditor.SetWidth(editorW)
-		m.rpEditor.SetHeight(editorH)
-		m.rpResp.Width = editorW
-		m.rpResp.Height = respH
+		m.editor.SetWidth(editorW)
+		m.editor.SetHeight(editorH)
+		m.resp.Width = editorW
+		m.resp.Height = respH
+		return
+	}
+
+	if m.scr == screenCompose {
+		headerH := 3
+		editorW := contentW
+		editorH := (contentH - headerH) / 2
+		respH := contentH - headerH - editorH
+		if editorH < 6 {
+			editorH = 6
+		}
+		if respH < 4 {
+			respH = 4
+		}
+		m.editor.SetWidth(editorW)
+		m.editor.SetHeight(editorH)
+		m.resp.Width = editorW
+		m.resp.Height = respH
+		return
+	}
+
+	if m.scr == screenEdit {
+		headerH := 3
+		editorW := contentW
+		editorH := contentH - headerH
+		if editorH < 8 {
+			editorH = 8
+		}
+		m.editor.SetWidth(editorW)
+		m.editor.SetHeight(editorH)
+		return
+	}
+
+	if m.scr == screenBreakpoints {
+		m.bpList.SetSize(contentW, contentH-5)
+		m.bpInput.SetWidth(contentW)
 		return
 	}
 
@@ -337,7 +567,7 @@ func (m *Model) updateDetail() {
 	if f.Intercepted && f.Pending {
 		b.WriteString(m.styles.badgeWarn.Render("PENDENTE"))
 		b.WriteString(" ")
-		b.WriteString(m.styles.dim.Render("(f = forward, d = drop)"))
+		b.WriteString(m.styles.dim.Render("(e = edit, f = forward, d = drop)"))
 		b.WriteString("\n")
 	}
 	if f.Error != "" {
@@ -379,16 +609,48 @@ func (m Model) viewMain() string {
 
 func (m Model) viewRepeater() string {
 	header := lipgloss.JoinHorizontal(lipgloss.Left,
-		m.styles.title.Render("Repeater"),
+		m.styles.title.Render(m.editorTitle),
 		" ",
-		m.styles.dim.Render(m.rpStatus),
+		m.styles.dim.Render(m.status),
 	)
 
-	editor := m.styles.border.Render(m.rpEditor.View())
-	resp := m.styles.border.Render(m.rpResp.View())
+	editor := m.styles.border.Render(m.editor.View())
+	resp := m.styles.border.Render(m.resp.View())
 	footer := m.viewFooter()
 
 	return m.styles.app.Render(lipgloss.JoinVertical(lipgloss.Left, header, editor, resp, footer))
+}
+
+func (m Model) viewEdit() string {
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		m.styles.title.Render(m.editorTitle),
+		" ",
+		m.styles.dim.Render(m.status),
+	)
+
+	editor := m.styles.border.Render(m.editor.View())
+	footer := m.viewFooter()
+
+	return m.styles.app.Render(lipgloss.JoinVertical(lipgloss.Left, header, editor, footer))
+}
+
+func (m Model) viewBreakpoints() string {
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		m.styles.title.Render("Breakpoints"),
+		" ",
+		m.styles.dim.Render("a adicionar | enter alterna | del remove | esc volta"),
+	)
+
+	listBox := m.styles.border.Render(m.bpList.View())
+	input := ""
+	if m.bpAdding {
+		input = m.styles.border.Render(m.bpInput.View())
+	} else {
+		input = m.styles.border.Render(m.styles.dim.Render("pressione 'a' para adicionar"))
+	}
+	footer := m.viewFooter()
+
+	return m.styles.app.Render(lipgloss.JoinVertical(lipgloss.Left, header, listBox, input, footer))
 }
 
 func (m Model) viewHeader() string {
@@ -407,7 +669,18 @@ func (m Model) viewFooter() string {
 	if m.toast != "" && now.Before(m.toastUntil) {
 		toast = m.styles.status.Render(m.toast)
 	} else {
-		toast = m.styles.statusDim.Render("i intercept | f forward | d drop | r repeater | x export | q sair")
+		switch m.scr {
+		case screenMain:
+			toast = m.styles.statusDim.Render("i intercept | e edit | f forward | d drop | r repeater | c compose | b breakpoints | x export | q sair")
+		case screenRepeater, screenCompose:
+			toast = m.styles.statusDim.Render("Ctrl+S envia | Esc volta")
+		case screenEdit:
+			toast = m.styles.statusDim.Render("Ctrl+S aplica/forward | Esc volta")
+		case screenBreakpoints:
+			toast = m.styles.statusDim.Render("a add | enter toggle | del remove | esc volta")
+		default:
+			toast = m.styles.statusDim.Render("q sair")
+		}
 	}
 	return toast
 }
