@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"burpui/internal/httpraw"
 )
 
 type Config struct {
@@ -85,22 +88,86 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	p.emit(flow)
 
-	if p.ctrl.InterceptEnabled() {
+	shouldBreak := p.ctrl.ShouldBreak(flow.Method, flow.URL, flow.Host)
+	wantIntercept := p.ctrl.InterceptEnabled() || shouldBreak
+	canEdit := wantIntercept && canBufferRequest(r, p.cfg.MaxBodyBytes)
+
+	if wantIntercept {
 		flow.Intercepted = true
 		flow.Pending = true
+		if canEdit {
+			b, err := readBodyAll(r)
+			if err != nil {
+				flow.Error = err.Error()
+				flow.Pending = false
+				flow.Duration = time.Since(flow.StartedAt)
+				p.emit(flow)
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("bad request\n"))
+				return
+			}
+			flow.RequestBody = b
+			flow.ReqTruncated = false
+			flow.RawRequest = renderRawRequest(flow.Method, flow.URL, flow.Host, flow.RequestHeader, flow.RequestBody)
+		}
 		p.emit(flow)
-		decision := flow.waitDecision()
-		if decision == DecisionDrop {
-			flow.Error = "dropped"
-			flow.Pending = false
-			flow.Duration = time.Since(flow.StartedAt)
-			p.emit(flow)
-			w.WriteHeader(http.StatusTeapot)
-			_, _ = w.Write([]byte("dropped\n"))
-			return
+
+		for {
+			a := flow.waitAction()
+			switch a.Kind {
+			case ActionDrop:
+				flow.Error = "dropped"
+				flow.Pending = false
+				flow.Duration = time.Since(flow.StartedAt)
+				p.emit(flow)
+				w.WriteHeader(http.StatusTeapot)
+				_, _ = w.Write([]byte("dropped\n"))
+				return
+			case ActionForward:
+				flow.Pending = false
+				p.emit(flow)
+				if canEdit {
+					outReq := buildOutgoingRequestFromOriginal(r, flow.RequestBody)
+					p.sendPreparedRequest(w, outReq, flow)
+					return
+				}
+				p.sendStreamedRequest(w, r, flow)
+				return
+			case ActionForwardRaw:
+				if !canEdit {
+					flow.Error = "edição não disponível para esta request"
+					p.emit(flow)
+					continue
+				}
+
+				req, bodyBytes, err := httpraw.ParseRequest(a.RawRequest)
+				if err != nil {
+					flow.Error = "parse: " + err.Error()
+					p.emit(flow)
+					continue
+				}
+
+				flow.Method = req.Method
+				flow.Host = req.Host
+				flow.URL = req.URL.String()
+				flow.RequestHeader = cloneHeader(req.Header)
+				flow.RequestBody = bodyBytes
+				flow.ReqTruncated = false
+				flow.RawRequest = a.RawRequest
+				flow.Error = ""
+				flow.Pending = false
+				p.emit(flow)
+
+				p.sendPreparedRequest(w, prepareRequestForRoundTrip(req), flow)
+				return
+			}
 		}
 	}
 
+	p.sendStreamedRequest(w, r, flow)
+}
+
+func (p *Proxy) sendStreamedRequest(w http.ResponseWriter, r *http.Request, flow *Flow) {
 	r.Close = false
 	outgoingURL := cloneURL(r.URL)
 	if outgoingURL.Scheme == "" {
@@ -124,6 +191,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq.Header = cleanHopByHopHeaders(cloneHeader(r.Header))
 	outReq.Body = body
 	outReq.Host = r.Host
+	outReq = prepareRequestForRoundTrip(outReq)
 
 	resp, err := p.transport.RoundTrip(outReq)
 	if err != nil {
@@ -141,6 +209,26 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	flow.RequestBody = lb.Bytes()
 	flow.ReqTruncated = lb.Truncated
+	p.writeResponse(w, resp, flow)
+}
+
+func (p *Proxy) sendPreparedRequest(w http.ResponseWriter, outReq *http.Request, flow *Flow) {
+	resp, err := p.transport.RoundTrip(outReq)
+	if err != nil {
+		flow.Error = err.Error()
+		flow.Pending = false
+		flow.Duration = time.Since(flow.StartedAt)
+		p.emit(flow)
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("bad gateway\n"))
+		return
+	}
+	defer resp.Body.Close()
+
+	p.writeResponse(w, resp, flow)
+}
+
+func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response, flow *Flow) {
 	flow.StatusCode = resp.StatusCode
 	flow.ResponseHeader = cloneHeader(resp.Header)
 
@@ -172,6 +260,90 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	flow.Pending = false
 	flow.Duration = time.Since(flow.StartedAt)
 	p.emit(flow)
+}
+
+func canBufferRequest(r *http.Request, maxBodyBytes int) bool {
+	if r.Body == nil {
+		return true
+	}
+	if r.ContentLength < 0 {
+		return false
+	}
+	if maxBodyBytes <= 0 {
+		return true
+	}
+	return int64(maxBodyBytes) >= r.ContentLength
+}
+
+func readBodyAll(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	defer r.Body.Close()
+	return io.ReadAll(r.Body)
+}
+
+func buildOutgoingRequestFromOriginal(r *http.Request, body []byte) *http.Request {
+	r.Close = false
+	outgoingURL := cloneURL(r.URL)
+	if outgoingURL.Scheme == "" {
+		outgoingURL.Scheme = "http"
+	}
+	if outgoingURL.Host == "" {
+		outgoingURL.Host = r.Host
+	}
+
+	outReq := &http.Request{}
+	*outReq = *r
+	outReq.URL = outgoingURL
+	outReq.RequestURI = ""
+	outReq.Header = cleanHopByHopHeaders(cloneHeader(r.Header))
+	outReq.Body = io.NopCloser(bytes.NewReader(body))
+	outReq.Host = r.Host
+	return prepareRequestForRoundTrip(outReq)
+}
+
+func prepareRequestForRoundTrip(req *http.Request) *http.Request {
+	if req == nil {
+		return req
+	}
+	req.RequestURI = ""
+	req.Header = cleanHopByHopHeaders(cloneHeader(req.Header))
+	req.Close = false
+	if req.URL != nil && req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	}
+	if req.URL != nil && req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
+	return req
+}
+
+func renderRawRequest(method, urlStr, host string, header http.Header, body []byte) string {
+	var b strings.Builder
+	if urlStr == "" {
+		urlStr = "/"
+	}
+	b.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, urlStr))
+	if host != "" {
+		b.WriteString("Host: ")
+		b.WriteString(host)
+		b.WriteString("\r\n")
+	}
+	for k, vv := range header {
+		if strings.EqualFold(k, "Host") {
+			continue
+		}
+		for _, v := range vv {
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(v)
+			b.WriteString("\r\n")
+		}
+	}
+	b.WriteString("\r\n")
+	b.Write(body)
+	return b.String()
 }
 
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
