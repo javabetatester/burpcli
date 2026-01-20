@@ -14,12 +14,15 @@ import (
 	"strings"
 	"time"
 
+	"burpui/internal/ca"
 	"burpui/internal/httpraw"
 )
 
 type Config struct {
 	ListenAddr   string
 	MaxBodyBytes int
+	MITM         bool
+	CADir        string
 }
 
 type Proxy struct {
@@ -29,6 +32,7 @@ type Proxy struct {
 
 	server    *http.Server
 	transport *http.Transport
+	ca        *ca.Store
 }
 
 type readerCloser struct {
@@ -36,14 +40,21 @@ type readerCloser struct {
 	io.Closer
 }
 
-func New(cfg Config, ctrl *Controller, flowCh chan<- *FlowSnapshot) *Proxy {
+func New(cfg Config, ctrl *Controller, flowCh chan<- *FlowSnapshot) (*Proxy, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = nil
 	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 
 	p := &Proxy{cfg: cfg, ctrl: ctrl, flowCh: flowCh, transport: tr}
+	if cfg.MITM {
+		st, err := ca.LoadOrCreate(cfg.CADir)
+		if err != nil {
+			return nil, err
+		}
+		p.ca = st
+	}
 	p.server = &http.Server{Addr: cfg.ListenAddr, Handler: p}
-	return p
+	return p, nil
 }
 
 func (p *Proxy) Serve(ctx context.Context) error {
@@ -71,6 +82,10 @@ func (p *Proxy) Serve(ctx context.Context) error {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.MITM && r.Method != http.MethodConnect && r.URL != nil && r.URL.IsAbs() && r.URL.Scheme == "http" && (r.URL.Host == "burpui.local" || r.URL.Host == "burpui") && (r.URL.Path == "/ca" || r.URL.Path == "/cacert") {
+		p.serveCA(w)
+		return
+	}
 	if r.Method == http.MethodConnect {
 		p.handleConnect(w, r)
 		return
@@ -347,6 +362,10 @@ func renderRawRequest(method, urlStr, host string, header http.Header, body []by
 }
 
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.MITM && p.ca != nil {
+		p.handleConnectMITM(w, r)
+		return
+	}
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -372,6 +391,200 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_ = copyAndClose(targetConn, buf)
 	}()
 	_ = copyAndClose(clientConn, targetConn)
+}
+
+func (p *Proxy) serveCA(w http.ResponseWriter) {
+	if p.ca == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", "attachment; filename=burpui-ca.pem")
+	_, _ = w.Write(p.ca.RootCertPEM())
+}
+
+func (p *Proxy) handleConnectMITM(w http.ResponseWriter, r *http.Request) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, buf, err := hijacker.Hijack()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	bc := bufferedConn{Conn: clientConn, r: buf}
+
+	host := r.Host
+	hostname := host
+	if strings.Contains(host, ":") {
+		if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
+			hostname = h
+		}
+	}
+
+	certPEM, keyPEM, err := p.ca.LeafCert(hostname)
+	if err != nil {
+		_ = clientConn.Close()
+		return
+	}
+	leaf, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		_ = clientConn.Close()
+		return
+	}
+
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	tlsSrv := tls.Server(bc, &tls.Config{
+		Certificates: []tls.Certificate{leaf},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err := tlsSrv.Handshake(); err != nil {
+		_ = tlsSrv.Close()
+		return
+	}
+
+	br := bufio.NewReader(tlsSrv)
+	for {
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			_ = tlsSrv.Close()
+			return
+		}
+
+		req.URL.Scheme = "https"
+		req.URL.Host = host
+		req.RequestURI = ""
+		if req.Host == "" {
+			req.Host = host
+		}
+
+		p.handleMITMRequest(tlsSrv, req, hostname)
+	}
+}
+
+type bufferedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c bufferedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+func (p *Proxy) handleMITMRequest(clientConn net.Conn, req *http.Request, hostname string) {
+	flow := newFlow()
+	flow.Method = req.Method
+	flow.Host = hostname
+	flow.URL = req.URL.String()
+	flow.RequestHeader = cloneHeader(req.Header)
+
+	shouldBreak := p.ctrl.ShouldBreak(flow.Method, flow.URL, flow.Host)
+	wantIntercept := p.ctrl.InterceptEnabled() || shouldBreak
+	canEdit := wantIntercept && canBufferRequest(req, p.cfg.MaxBodyBytes)
+
+	if wantIntercept {
+		flow.Intercepted = true
+		flow.Pending = true
+		if canEdit {
+			b, err := readBodyAll(req)
+			if err != nil {
+				flow.Error = err.Error()
+				flow.Pending = false
+				flow.Duration = time.Since(flow.StartedAt)
+				p.emit(flow)
+				return
+			}
+			flow.RequestBody = b
+			flow.RawRequest = renderRawRequest(flow.Method, flow.URL, flow.Host, flow.RequestHeader, flow.RequestBody)
+			req.Body = io.NopCloser(bytes.NewReader(b))
+			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
+		}
+		p.emit(flow)
+
+		for {
+			a := flow.waitAction()
+			switch a.Kind {
+			case ActionDrop:
+				flow.Error = "dropped"
+				flow.Pending = false
+				flow.Duration = time.Since(flow.StartedAt)
+				p.emit(flow)
+				return
+			case ActionForward:
+				flow.Pending = false
+				p.emit(flow)
+				p.forwardMITM(clientConn, req, flow)
+				return
+			case ActionForwardRaw:
+				if !canEdit {
+					flow.Error = "edição não disponível para esta request"
+					p.emit(flow)
+					continue
+				}
+				req2, bodyBytes, err := httpraw.ParseRequest(a.RawRequest)
+				if err != nil {
+					flow.Error = "parse: " + err.Error()
+					p.emit(flow)
+					continue
+				}
+				if req2.URL != nil {
+					req2.URL.Scheme = "https"
+				}
+				req2.RequestURI = ""
+				flow.Method = req2.Method
+				flow.Host = hostname
+				flow.URL = req2.URL.String()
+				flow.RequestHeader = cloneHeader(req2.Header)
+				flow.RequestBody = bodyBytes
+				flow.RawRequest = a.RawRequest
+				flow.Error = ""
+				flow.Pending = false
+				p.emit(flow)
+
+				req2.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				req2.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(bodyBytes)), nil }
+				p.forwardMITM(clientConn, prepareRequestForRoundTrip(req2), flow)
+				return
+			}
+		}
+	}
+
+	p.forwardMITM(clientConn, prepareRequestForRoundTrip(req), flow)
+}
+
+func (p *Proxy) forwardMITM(clientConn net.Conn, req *http.Request, flow *Flow) {
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		flow.Error = err.Error()
+		flow.Pending = false
+		flow.Duration = time.Since(flow.StartedAt)
+		p.emit(flow)
+		return
+	}
+	defer resp.Body.Close()
+
+	flow.StatusCode = resp.StatusCode
+	flow.ResponseHeader = cloneHeader(resp.Header)
+	flow.ReqTruncated = false
+	flow.RespTruncated = false
+
+	respLB := NewLimitBuffer(p.cfg.MaxBodyBytes)
+	resp.Body = readerCloser{Reader: io.TeeReader(resp.Body, respLB), Closer: resp.Body}
+
+	bw := bufio.NewWriter(clientConn)
+	_ = resp.Write(bw)
+	_ = bw.Flush()
+
+	flow.ResponseBody = respLB.Bytes()
+	flow.RespTruncated = respLB.Truncated
+	flow.Pending = false
+	flow.Duration = time.Since(flow.StartedAt)
+	p.emit(flow)
 }
 
 func copyAndClose(dst io.WriteCloser, src io.Reader) error {

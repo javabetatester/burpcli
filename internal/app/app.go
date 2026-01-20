@@ -17,12 +17,17 @@ import (
 type Config struct {
 	ListenAddr   string
 	MaxBodyBytes int
+	MITM         bool
+	CADir        string
 }
 
 func Run(cfg Config) error {
 	flowCh := make(chan *proxy.FlowSnapshot, 1024)
 	ctrl := proxy.NewController()
-	px := proxy.New(proxy.Config{ListenAddr: cfg.ListenAddr, MaxBodyBytes: cfg.MaxBodyBytes}, ctrl, flowCh)
+	px, err := proxy.New(proxy.Config{ListenAddr: cfg.ListenAddr, MaxBodyBytes: cfg.MaxBodyBytes, MITM: cfg.MITM, CADir: cfg.CADir}, ctrl, flowCh)
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
