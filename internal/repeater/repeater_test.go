@@ -1,10 +1,13 @@
 package repeater
 
-import "testing"
+import (
+	"burpui/internal/httpraw"
+	"testing"
+)
 
 func TestParseRawRequest_PathOnly(t *testing.T) {
 	raw := "GET /foo HTTP/1.1\r\nHost: example.com\r\nUser-Agent: x\r\n\r\n"
-	req, err := parseRawRequest(raw)
+	req, _, err := httpraw.ParseRequest(raw)
 	if err != nil {
 		t.Fatalf("expected nil err, got %v", err)
 	}
@@ -21,7 +24,7 @@ func TestParseRawRequest_PathOnly(t *testing.T) {
 
 func TestParseRawRequest_AbsoluteURL(t *testing.T) {
 	raw := "GET https://example.com/foo HTTP/1.1\r\nUser-Agent: x\r\n\r\n"
-	req, err := parseRawRequest(raw)
+	req, _, err := httpraw.ParseRequest(raw)
 	if err != nil {
 		t.Fatalf("expected nil err, got %v", err)
 	}
