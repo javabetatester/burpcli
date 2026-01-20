@@ -38,6 +38,18 @@ func Run(cfg Config) error {
 		SetIntercept: func(on bool) {
 			ctrl.SetIntercept(on)
 		},
+		ListBreakpoints: func() []proxy.BreakpointRule {
+			return ctrl.ListBreakpoints()
+		},
+		AddBreakpoint: func(match string) {
+			ctrl.AddBreakpoint(match)
+		},
+		ToggleBreakpoint: func(id int64) {
+			ctrl.ToggleBreakpoint(id)
+		},
+		RemoveBreakpoint: func(id int64) {
+			ctrl.RemoveBreakpoint(id)
+		},
 	})
 
 	p := tea.NewProgram(model, tea.WithAltScreen())
