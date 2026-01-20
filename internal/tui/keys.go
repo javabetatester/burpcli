@@ -8,9 +8,15 @@ type keyMap struct {
 	Forward         key.Binding
 	Drop            key.Binding
 	Repeater        key.Binding
+	Compose         key.Binding
+	Edit            key.Binding
+	Breakpoints     key.Binding
 	Export          key.Binding
 	Back            key.Binding
 	Send            key.Binding
+	Add             key.Binding
+	Toggle          key.Binding
+	Remove          key.Binding
 }
 
 func newKeyMap() keyMap {
@@ -20,8 +26,14 @@ func newKeyMap() keyMap {
 		Forward:         key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "forward")),
 		Drop:            key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "drop")),
 		Repeater:        key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "repeater")),
+		Compose:         key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "compose")),
+		Edit:            key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit")),
+		Breakpoints:     key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "breakpoints")),
 		Export:          key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "export")),
 		Back:            key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "voltar")),
 		Send:            key.NewBinding(key.WithKeys("ctrl+s"), key.WithHelp("ctrl+s", "enviar")),
+		Add:             key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add")),
+		Toggle:          key.NewBinding(key.WithKeys("enter", "t"), key.WithHelp("enter", "toggle")),
+		Remove:          key.NewBinding(key.WithKeys("delete", "backspace"), key.WithHelp("del", "remove")),
 	}
 }
