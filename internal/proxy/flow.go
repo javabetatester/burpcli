@@ -6,12 +6,18 @@ import (
 	"time"
 )
 
-type Decision int
+type ActionKind int
 
 const (
-	DecisionForward Decision = iota
-	DecisionDrop
+	ActionForward ActionKind = iota
+	ActionDrop
+	ActionForwardRaw
 )
+
+type Action struct {
+	Kind       ActionKind
+	RawRequest string
+}
 
 type Flow struct {
 	ID             int64
@@ -23,6 +29,7 @@ type Flow struct {
 	RequestHeader  http.Header
 	RequestBody    []byte
 	ReqTruncated   bool
+	RawRequest     string
 	StatusCode     int
 	ResponseHeader http.Header
 	ResponseBody   []byte
@@ -30,7 +37,7 @@ type Flow struct {
 	Error          string
 	Intercepted    bool
 	Pending        bool
-	decisionCh     chan Decision
+	actionCh       chan Action
 }
 
 type FlowSnapshot struct {
@@ -40,16 +47,28 @@ type FlowSnapshot struct {
 var nextID atomic.Int64
 
 func newFlow() *Flow {
-	return &Flow{ID: nextID.Add(1), StartedAt: time.Now(), Pending: true, decisionCh: make(chan Decision, 1)}
+	return &Flow{ID: nextID.Add(1), StartedAt: time.Now(), Pending: true, actionCh: make(chan Action, 1)}
 }
 
-func (f *Flow) Decide(d Decision) {
+func (f *Flow) Forward() {
+	f.send(Action{Kind: ActionForward})
+}
+
+func (f *Flow) Drop() {
+	f.send(Action{Kind: ActionDrop})
+}
+
+func (f *Flow) ForwardRaw(rawRequest string) {
+	f.send(Action{Kind: ActionForwardRaw, RawRequest: rawRequest})
+}
+
+func (f *Flow) send(a Action) {
 	select {
-	case f.decisionCh <- d:
+	case f.actionCh <- a:
 	default:
 	}
 }
 
-func (f *Flow) waitDecision() Decision {
-	return <-f.decisionCh
+func (f *Flow) waitAction() Action {
+	return <-f.actionCh
 }
