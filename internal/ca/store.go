@@ -4,8 +4,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -116,6 +118,24 @@ func (s *Store) RootCertPEM() []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]byte(nil), s.caCertPEM...)
+}
+
+func (s *Store) RootCertDER() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.caCert == nil {
+		return nil
+	}
+	return append([]byte(nil), s.caCert.Raw...)
+}
+
+func (s *Store) RootThumbprintSHA1() string {
+	der := s.RootCertDER()
+	if len(der) == 0 {
+		return ""
+	}
+	sum := sha1.Sum(der)
+	return strings.ToUpper(hex.EncodeToString(sum[:]))
 }
 
 func (s *Store) LeafCert(host string) (certPEM []byte, keyPEM []byte, err error) {

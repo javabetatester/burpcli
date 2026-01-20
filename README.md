@@ -30,6 +30,12 @@ Gera (se não existir) e exporta o CA raiz:
 go run ./cmd/burpui --ca-dir ./ca --export-ca burpui-ca.pem
 ```
 
+Auto-instalar no Windows (CurrentUser):
+
+```bash
+go run ./cmd/burpui --ca-dir ./ca --install-ca
+```
+
 Instalação (resumo):
 
 - Windows: importar `burpui-ca.pem` em “Trusted Root Certification Authorities”

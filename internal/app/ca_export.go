@@ -17,3 +17,11 @@ func ExportCA(caDir string, outPath string) error {
 	}
 	return os.WriteFile(outPath, st.RootCertPEM(), 0o644)
 }
+
+func InstallCA(caDir string) (string, error) {
+	return ca.InstallRootCA(caDir, ca.ScopeCurrentUser)
+}
+
+func UninstallCA(caDir string) (string, error) {
+	return ca.UninstallRootCA(caDir, ca.ScopeCurrentUser)
+}
