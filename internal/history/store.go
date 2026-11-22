@@ -33,6 +33,9 @@ type Store struct {
 	nextID  atomic.Uint64
 	version atomic.Uint64
 
+	obsMu     sync.Mutex
+	observers []func(*flow.Flow)
+
 	mu    sync.RWMutex
 	ring  []*flow.Flow
 	start int
@@ -69,6 +72,13 @@ func (s *Store) NextID() uint64 { return s.nextID.Add(1) }
 // Version changes whenever the store content changes.
 func (s *Store) Version() uint64 { return s.version.Load() }
 
+// OnRecord registers fn to be called, synchronously, after every Record.
+func (s *Store) OnRecord(fn func(*flow.Flow)) {
+	s.obsMu.Lock()
+	s.observers = append(s.observers, fn)
+	s.obsMu.Unlock()
+}
+
 // Record stores a finished flow and persists it when a Persister is configured.
 func (s *Store) Record(f *flow.Flow) {
 	s.push(f)
@@ -76,6 +86,12 @@ func (s *Store) Record(f *flow.Flow) {
 		if err := s.persist.Save(f); err != nil {
 			s.log.Error("persist flow", "id", f.ID, "err", err)
 		}
+	}
+	s.obsMu.Lock()
+	obs := append([]func(*flow.Flow){}, s.observers...)
+	s.obsMu.Unlock()
+	for _, fn := range obs {
+		fn(f)
 	}
 }
 

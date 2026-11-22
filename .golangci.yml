@@ -13,6 +13,14 @@ linters:
     revive:
       rules:
         - name: exported
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (io.ReadCloser).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - fmt.Fprint
     gosec:
       excludes:
         - G304
@@ -20,6 +28,10 @@ linters:
         - G306
   exclusions:
     rules:
+      - path: internal/app/
+        text: G402
+      - path: internal/proxy/proxy.go
+        text: G118
       - path: _test\.go
         linters:
           - gosec

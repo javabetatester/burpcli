@@ -93,3 +93,14 @@ func TestSQLitePersistenceReload(t *testing.T) {
 		t.Fatalf("next id = %d", id)
 	}
 }
+
+func TestOnRecordObserver(t *testing.T) {
+	s, _ := New(2, nil, nil)
+	var got []uint64
+	s.OnRecord(func(f *flow.Flow) { got = append(got, f.ID) })
+	s.Record(mk(1, "a.test", ""))
+	s.Record(mk(2, "a.test", ""))
+	if len(got) != 2 || got[1] != 2 {
+		t.Fatalf("observed = %v", got)
+	}
+}

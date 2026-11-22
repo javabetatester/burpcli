@@ -54,7 +54,7 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	f.Response = &flow.Response{Status: http.StatusOK, Proto: "HTTP/1.1"}
 	if s.ca != nil {
 		_ = client.SetReadDeadline(time.Now().Add(peekWait))
-		first, err := rw.Reader.Peek(1)
+		first, err := rw.Peek(1)
 		_ = client.SetReadDeadline(time.Time{})
 		if err == nil && first[0] == tlsHandshakeByte {
 			f.Tunnel = false
