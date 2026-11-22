@@ -81,3 +81,20 @@ func TestPersistAndPerms(t *testing.T) {
 		t.Fatalf("want ErrInsecurePerms, got %v", err)
 	}
 }
+
+func BenchmarkLeafCacheHit(b *testing.B) {
+	a, _ := Generate()
+	_, _ = a.Leaf("bench.test")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = a.Leaf("bench.test")
+	}
+}
+
+func BenchmarkLeafMint(b *testing.B) {
+	a, _ := Generate()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = a.mint("bench.test")
+	}
+}
