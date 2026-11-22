@@ -113,7 +113,7 @@ func (a *Authority) Save(dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, keyFile), keyPEM, 0o600); err != nil {
 		return fmt.Errorf("ca: write key: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, certFile), a.certPEM, 0o644); err != nil { //nolint:gosec
+	if err := os.WriteFile(filepath.Join(dir, certFile), a.certPEM, 0o644); err != nil {
 		return fmt.Errorf("ca: write cert: %w", err)
 	}
 	return nil

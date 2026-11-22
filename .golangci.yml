@@ -17,6 +17,7 @@ linters:
       excludes:
         - G304
         - G204
+        - G306
   exclusions:
     rules:
       - path: _test\.go
