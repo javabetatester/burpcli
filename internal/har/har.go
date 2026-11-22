@@ -93,6 +93,7 @@ func Write(w io.Writer, version string, flows []*flow.Flow) error {
 		doc.Log.Entries = append(doc.Log.Entries, toEntry(f))
 	}
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(doc); err != nil {
 		return fmt.Errorf("har: encode: %w", err)
