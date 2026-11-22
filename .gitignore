@@ -1,0 +1,8 @@
+/bin/
+*.exe
+*.test
+*.out
+*.db
+*.db-*
+*.har
+/ca/
