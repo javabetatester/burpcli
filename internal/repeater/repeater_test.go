@@ -41,7 +41,9 @@ func TestDiff(t *testing.T) {
 			t.Errorf("diff missing %q:\n%s", want, got)
 		}
 	}
-	if strings.ContainsAny(Diff(a, a), "+-") && strings.Contains(Diff(a, a), "\n+") {
-		t.Error("identical responses must have no changes")
+	for _, l := range strings.Split(Diff(a, a), "\n") {
+		if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") {
+			t.Errorf("identical responses produced change %q", l)
+		}
 	}
 }
